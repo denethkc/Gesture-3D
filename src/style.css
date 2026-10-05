@@ -1,0 +1,150 @@
+html, body {
+  margin: 0;
+  height: 100%;
+  background: radial-gradient(circle at 50% 38%, #1a2238 0%, #0a0d18 55%, #05060a 100%);
+  color: #e8ecf5;
+  font-family: system-ui, sans-serif;
+  overflow: hidden;
+}
+
+#stage {
+  position: fixed;
+  inset: 0;
+}
+
+/* camera preview, mirrored so it feels like a mirror */
+#cam {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  width: 240px;
+  height: 180px;
+  transform: scaleX(-1);
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid #2a3350;
+  opacity: 0.9;
+  z-index: 5;
+}
+
+#cam video,
+#cam canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.panel,
+#hud,
+#help,
+#info {
+  background: rgba(15, 20, 35, 0.72);
+  border: 1px solid #2a3350;
+  border-radius: 10px;
+  backdrop-filter: blur(6px);
+}
+
+#hud {
+  position: fixed;
+  left: 16px;
+  top: 16px;
+  padding: 10px 14px;
+  font-size: 14px;
+  line-height: 1.5;
+  white-space: pre;
+  z-index: 5;
+}
+
+#help {
+  position: fixed;
+  left: 16px;
+  bottom: 16px;
+  padding: 10px 14px;
+  font-size: 13px;
+  line-height: 1.7;
+  z-index: 5;
+}
+
+#help small {
+  color: #8f9bbd;
+}
+
+/* part labels follow the parts in 3D */
+#labels {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+  z-index: 3;
+}
+
+.label {
+  position: absolute;
+  left: 0;
+  top: 0;
+  padding: 2px 8px;
+  font-size: 12px;
+  white-space: nowrap;
+  color: #dfe6ff;
+  background: rgba(10, 14, 28, 0.75);
+  border: 1px solid rgba(120, 140, 200, 0.5);
+  border-radius: 999px;
+  opacity: 0;
+  transition: opacity 0.15s linear;
+  will-change: transform, opacity;
+}
+
+.label.sel {
+  color: #05060a;
+  background: #ffd166;
+  border-color: #ffd166;
+  font-weight: 600;
+}
+
+/* hand cursor (thumb/index midpoint) */
+#cursor {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 2px solid #4cc9f0;
+  pointer-events: none;
+  display: none;
+  z-index: 6;
+}
+
+#cursor.pinch {
+  background: rgba(255, 209, 102, 0.85);
+  border-color: #ffd166;
+}
+
+/* inspect card */
+#info {
+  position: fixed;
+  right: 16px;
+  top: 16px;
+  width: 260px;
+  padding: 12px 16px;
+  display: none;
+  z-index: 5;
+}
+
+#info h3 {
+  margin: 0 0 6px;
+  font-size: 17px;
+  color: #ffd166;
+}
+
+#info p {
+  margin: 0 0 8px;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+#info small {
+  color: #8f9bbd;
+}

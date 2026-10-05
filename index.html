@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Gesture 3D</title>
+  </head>
+  <body>
+    <div id="stage"></div>
+    <div id="labels"></div>
+    <div id="cursor"></div>
+
+    <div id="cam">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="overlay" width="640" height="480"></canvas>
+    </div>
+
+    <div id="hud">Starting…</div>
+
+    <div id="info">
+      <h3 id="infoName"></h3>
+      <p id="infoDesc"></p>
+      <small id="infoMeta"></small>
+    </div>
+
+    <div id="help">
+      <b>Gestures</b><br />
+      ✋ Open / close hand: explode / assemble<br />
+      👋 Move one hand: the model follows it<br />
+      🙌 Two hands: spread apart = zoom in, bring together = zoom out<br />
+      🤏 Pinch a part: inspect it (pinch empty space to clear)<br />
+      👈 Swipe one hand right → left: next model<br />
+      <small>Mouse: click a part · N / P = next / previous · Esc = clear</small>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
