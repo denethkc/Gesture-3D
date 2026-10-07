@@ -1,38 +1,85 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Gesture 3D</title>
-  </head>
-  <body>
-    <div id="stage"></div>
-    <div id="labels"></div>
-    <div id="cursor"></div>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gesture 3D</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&display=swap" rel="stylesheet" />
+</head>
+<body>
+  <div id="stage">
+    <video id="cam" playsinline muted></video>
+    <svg id="lines"></svg>
+    <div id="tags"></div>
+    <canvas id="hud"></canvas>
+  </div>
 
-    <div id="cam">
-      <video id="video" autoplay playsinline muted></video>
-      <canvas id="overlay" width="640" height="480"></canvas>
+  <aside id="panel">
+    <header class="brand">
+      <span class="mark"></span>
+      <div>
+        <h1>Gesture 3D</h1>
+        <p>Open your hand to look inside</p>
+      </div>
+    </header>
+
+    <div class="meta">
+      <span class="chip chip-amber" id="chipGroup">Machines</span>
+      <span class="chip" id="chipParts">0 parts</span>
+    </div>
+    <h2 id="mTitle">Loading…</h2>
+    <p id="mBlurb" class="muted"></p>
+
+    <div class="tiles">
+      <div class="tile"><span>Tracking</span><b id="stTrack">Starting…</b></div>
+      <div class="tile"><span>Hands</span><b id="stHands">0</b></div>
     </div>
 
-    <div id="hud">Starting…</div>
+    <label class="slider">
+      <div class="row"><span>Explode</span><output id="exVal">0%</output></div>
+      <input id="exRange" type="range" min="0" max="1" step="0.01" value="0" />
+    </label>
+    <label class="slider">
+      <div class="row"><span>Explode intensity</span><output id="inVal">100%</output></div>
+      <input id="inRange" type="range" min="0.2" max="1.5" step="0.01" value="1" />
+    </label>
+
+    <h3>Gestures</h3>
+    <ul id="gestures">
+      <li data-g="open"><i>🖐️</i><div><b>Open slowly</b><span>explode it, see inside</span></div></li>
+      <li data-g="close"><i>✊</i><div><b>Close your hand</b><span>pull it back together</span></div></li>
+      <li data-g="move"><i>👋</i><div><b>Move or twist</b><span>move, rotate and tilt it</span></div></li>
+      <li data-g="point"><i>👆</i><div><b>Point</b><span>highlight a part</span></div></li>
+      <li data-g="pinch"><i>🤏</i><div><b>Pinch a part</b><span>pull it out, drag it</span></div></li>
+      <li data-g="two"><i>🙌</i><div><b>Two hands</b><span>apart or together to zoom</span></div></li>
+      <li data-g="swipe"><i>👈</i><div><b>Swipe left</b><span>next model</span></div></li>
+    </ul>
 
     <div id="info">
-      <h3 id="infoName"></h3>
-      <p id="infoDesc"></p>
-      <small id="infoMeta"></small>
+      <b id="infoTitle">No part selected</b>
+      <p id="infoText">Point at a part, or click one, to see its name.</p>
     </div>
 
-    <div id="help">
-      <b>Gestures</b><br />
-      ✋ Open / close hand: explode / assemble<br />
-      👋 Move one hand: the model follows it<br />
-      🙌 Two hands: spread apart = zoom in, bring together = zoom out<br />
-      🤏 Pinch a part: inspect it (pinch empty space to clear)<br />
-      👈 Swipe one hand right → left: next model<br />
-      <small>Mouse: click a part · N / P = next / previous · Esc = clear</small>
+    <div class="actions">
+      <button id="btnAssemble" type="button">Assemble</button>
+      <button id="btnSpin" type="button">Auto spin</button>
     </div>
+  </aside>
 
-    <script type="module" src="/src/main.js"></script>
-  </body>
+  <div id="tools">
+    <button id="btnSnap" type="button" title="Save snapshot" aria-label="Save snapshot">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>
+    </button>
+    <button id="btnFull" type="button" title="Fullscreen" aria-label="Fullscreen">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+    </button>
+  </div>
+
+  <nav id="models" aria-label="Models"></nav>
+  <div id="toast" role="status"></div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
 </html>

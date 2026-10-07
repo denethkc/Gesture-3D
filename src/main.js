@@ -1,688 +1,793 @@
 import './style.css';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
+import { OneEuro, damp, clamp, clamp01 } from './smooth.js';
 
-const WASM = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
-const HAND_MODEL =
-  'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+/* =====================================================================
+   CONFIG: tweak these to change the feel
+   ===================================================================== */
+const CONFIG = {
+  modelSize: 2.4, // model is scaled so its biggest side equals this
+  camZ: 6,
+  filter: { minCutoff: 1.4, beta: 7 }, // One Euro: lower minCutoff = smoother, higher beta = less lag
+  follow: 12, // how fast the model follows the hand (higher = snappier)
+  rotate: 9,
+  zoom: 9,
+  explode: 8,
+  yawGain: 1.2, // flip the sign if twisting your hand turns the model the wrong way
+  pitchGain: 1.0,
+  pinchOn: 0.3,
+  pinchOff: 0.45,
+  swipe: { dist: 0.32, windowMs: 450, cooldownMs: 1300 },
+  maxLabels: 8,
+};
 
-/* GLB files live in /public/models. Add your own here (they load in this order). */
-const GLB_MODELS = [
-  { url: '/models/engine.glb', name: 'Engine' },
-  { url: '/models/ferrari.glb', name: 'Ferrari' },
-  { url: '/models/ReciprocatingSaw.glb', name: 'Reciprocating Saw' },
-  { url: '/models/GearboxAssy.glb', name: 'Gearbox' },
-  { url: '/models/zbrush_for_concept_-_mech_design_d_ver.glb', name: 'Mech Design' },
-  { url: '/models/time_machine.glb', name: 'Time Machine' },
+/* Put your .glb files in /public/models/ and list them here */
+const MODELS = [
+  { name: 'Ferrari', group: 'Machines', file: '/models/ferrari.glb', blurb: 'Body, chassis, drivetrain and interior.' },
+  { name: 'Time Machine', group: 'Machines', file: '/models/time_machine.glb', blurb: 'Dials, frame and mechanism of a time machine.' },
+  { name: 'Mech Design', group: 'Machines', file: '/models/zbrush_for_concept_-_mech_design_d_ver.glb', blurb: 'Concept mech sculpt, split into its parts.' },
 ];
 
-/* ---- tuning knobs ---- */
-const FOLLOW_MOVE = 0.7; // how far the model moves with your hand (0 = never, 1 = to the screen edge)
-const FOLLOW_ROTATE = 1.0; // how much it turns with your hand (0 = never)
-const SWIPE_DIST = 0.22; // swipe: hand travel as a fraction of camera width...
-const SWIPE_WINDOW = 0.4; // ...within this many seconds
-const SWIPE_COOLDOWN = 1.0; // seconds before the next swipe is accepted
-const SWIPE_PREVIOUS = false; // true = left -> right swipe goes to the previous model
-const ZOOM_MIN = 5;
-const ZOOM_MAX = 22;
-const ZOOM_START = 11;
+const HAND_LINKS = [
+  [0, 1], [1, 2], [2, 3], [3, 4], [0, 5], [5, 6], [6, 7], [7, 8], [5, 9], [9, 10], [10, 11], [11, 12],
+  [9, 13], [13, 14], [14, 15], [15, 16], [13, 17], [17, 18], [18, 19], [19, 20], [0, 17],
+];
 
-const video = document.getElementById('video');
-const overlay = document.getElementById('overlay');
-const octx = overlay.getContext('2d');
-const hud = document.getElementById('hud');
-const labelsEl = document.getElementById('labels');
-const cursorEl = document.getElementById('cursor');
-const infoEl = document.getElementById('info');
-const infoName = document.getElementById('infoName');
-const infoDesc = document.getElementById('infoDesc');
-const infoMeta = document.getElementById('infoMeta');
+/* =====================================================================
+   DOM
+   ===================================================================== */
+const $ = (s) => document.querySelector(s);
+const stage = $('#stage');
+const video = $('#cam');
+const hud = $('#hud');
+const hctx = hud.getContext('2d');
+const linesSvg = $('#lines');
+const tagsEl = $('#tags');
+const panel = $('#panel');
+const toast = $('#toast');
+const ui = {
+  track: $('#stTrack'), hands: $('#stHands'),
+  exRange: $('#exRange'), exVal: $('#exVal'), inRange: $('#inRange'), inVal: $('#inVal'),
+  title: $('#mTitle'), blurb: $('#mBlurb'), group: $('#chipGroup'), parts: $('#chipParts'),
+  info: $('#info'), infoTitle: $('#infoTitle'), infoText: $('#infoText'),
+  gestures: [...document.querySelectorAll('#gestures li')],
+  models: $('#models'), spin: $('#btnSpin'),
+};
 
-/* ---------------- Three.js scene (solid, lit, with reflections) ---------------- */
-const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 100);
-camera.position.set(0, 0, ZOOM_START);
+let toastTimer;
+function say(msg, ms = 2200) {
+  toast.textContent = msg;
+  toast.classList.add('show');
+  clearTimeout(toastTimer);
+  if (ms) toastTimer = setTimeout(() => toast.classList.remove('show'), ms);
+}
 
-const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-renderer.setClearColor(0x000000, 0);
-renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
-renderer.setSize(innerWidth, innerHeight);
+/* =====================================================================
+   THREE SCENE
+   ===================================================================== */
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.1;
-document.getElementById('stage').appendChild(renderer.domElement);
+renderer.toneMappingExposure = 1.05;
+stage.insertBefore(renderer.domElement, linesSvg);
 
-// a built-in "studio" environment gives metals and paint realistic reflections
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+camera.position.z = CONFIG.camZ;
+
 const pmrem = new THREE.PMREMGenerator(renderer);
 scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
-
-const key = new THREE.DirectionalLight(0xffffff, 1.8);
-key.position.set(5, 8, 6);
+const key = new THREE.DirectionalLight(0xffffff, 1.6);
+key.position.set(3, 4, 5);
 scene.add(key);
-const rim = new THREE.DirectionalLight(0x8fb4ff, 0.8);
-rim.position.set(-6, 2, -5);
-scene.add(rim);
+scene.add(new THREE.AmbientLight(0xffffff, 0.25));
 
-addEventListener('resize', () => {
-  camera.aspect = innerWidth / innerHeight;
+const rig = new THREE.Group(); // moved / rotated / scaled by the hand
+rig.rotation.order = 'YXZ';
+scene.add(rig);
+
+function resize() {
+  const w = stage.clientWidth;
+  const h = stage.clientHeight;
+  const dpr = Math.min(window.devicePixelRatio, 2);
+  renderer.setSize(w, h);
+  camera.aspect = w / h;
   camera.updateProjectionMatrix();
-  renderer.setSize(innerWidth, innerHeight);
-});
-
-const group = new THREE.Group(); // moved / rotated by your hand
-scene.add(group);
-
-/* ---------------- Names and descriptions ---------------- */
-// "Piston_123-844_0_Parts_1" -> "Piston", "rim_fl" -> "Rim fl"
-function cleanName(raw) {
-  const n = (raw || '')
-    .replace(/_+\d.*$/, '')
-    .replace(/[_\-.]+/g, ' ')
-    .replace(/\s*instance\s*\d*$/i, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (!n || /^(mesh|node|object|group)\s*\d*$/i.test(n)) return '';
-  return n.charAt(0).toUpperCase() + n.slice(1);
+  hud.width = w * dpr;
+  hud.height = h * dpr;
+  hctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
+window.addEventListener('resize', resize);
+resize();
 
-const DESCRIPTIONS = [
-  [/piston/i, 'Slides up and down inside a cylinder, turning pressure into motion.'],
-  [/^rod|conrod|connecting/i, 'Links the piston to the crankshaft and carries the force between them.'],
-  [/spring/i, 'Stores energy and pushes a part back to its starting position.'],
-  [/lifter|tappet/i, 'Follows the cam and opens the valve at exactly the right moment.'],
-  [/valve/i, 'Opens and closes to let air and fuel in, or exhaust out.'],
-  [/crank/i, 'Turns the up-and-down push of the pistons into rotation.'],
-  [/cam/i, 'A shaped lobe that controls when valves open and close.'],
-  [/gear|cog/i, 'Toothed wheel that passes on torque and changes speed.'],
-  [/shaft|axle/i, 'A rotating bar that carries power from one part to another.'],
-  [/bearing/i, 'Lets a shaft spin smoothly with very little friction.'],
-  [/bolt|screw|nut|washer/i, 'A fastener that holds neighbouring parts together.'],
-  [/tire|tyre/i, 'The rubber that grips the road and absorbs bumps.'],
-  [/rim|wheel/i, 'Carries the tire and transfers drive power to the road.'],
-  [/brake/i, 'Slows the wheel by squeezing it with friction pads.'],
-  [/glass|window|windshield/i, 'Transparent panel that lets the driver see out.'],
-  [/light|led/i, 'Lamp used for seeing, signalling or decoration.'],
-  [/wiper/i, 'Sweeps rain off the windscreen.'],
-  [/grill/i, 'Lets air flow in to cool the engine and brakes.'],
-  [/leather|seat/i, 'Soft upholstery covering the seats and trim.'],
-  [/steering/i, 'Part of the steering wheel and column that turns the front wheels.'],
-  [/carpet/i, 'Floor covering that reduces noise and wear.'],
-  [/chrome|metal/i, 'Polished metal trim.'],
-  [/carbon/i, 'Light, very strong carbon-fibre panel.'],
-  [/body|casing|housing|block/i, 'The main housing that holds the other parts in place.'],
-];
-const describe = (name, model) =>
-  (DESCRIPTIONS.find(([re]) => re.test(name)) || [null, `A component of the ${model}.`])[1];
+const halfH = () => Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * CONFIG.camZ;
 
-/* ---------------- Turning a .glb into explodable, selectable parts ---------------- */
-const tmpM = new THREE.Matrix4();
+/* =====================================================================
+   STATE
+   ===================================================================== */
+const S = {
+  t: { px: 0, py: 0, rx: 0, ry: 0, rz: 0, scale: 1, explode: 0 }, // targets (from the hand)
+  cur: { px: 0, py: 0, rx: 0, ry: 0, rz: 0, scale: 1, explode: 0 }, // what is drawn (eased)
+  intensity: 1,
+  spin: 0,
+  autoSpin: false,
+  hands: [],
+  handCount: 0,
+  lastSeen: 0,
+  gesture: '',
+  gestureUntil: 0,
+  pinching: false,
+  drag: null,
+  twoStart: null,
+  swipeHist: [],
+  swipeCooldown: 0,
+  openPrev: 0,
+  current: null,
+  index: -1,
+  selected: null,
+  loadToken: 0,
+  sliderActive: false,
+};
 
-function modelFromGLTF(modelName, gltf) {
+const filters = [];
+const openFilter = new OneEuro(1.2, 2);
+
+/* =====================================================================
+   MODELS
+   ===================================================================== */
+const loader = new GLTFLoader();
+const cache = new Map();
+const tmpBox = new THREE.Box3();
+
+const cleanName = (n) => n.replace(/[_.\-]+/g, ' ').replace(/\s*\d+$/, '').trim() || 'Part';
+
+function prepare(gltf) {
   const root = gltf.scene;
-  root.updateMatrixWorld(true);
+  const wrap = new THREE.Group();
+  wrap.add(root);
+  wrap.updateMatrixWorld(true);
 
-  // centre the model and scale it to a fixed size
-  const bounds = new THREE.Box3().setFromObject(root);
-  const centre = bounds.getCenter(new THREE.Vector3());
-  const size = bounds.getSize(new THREE.Vector3());
-  const s = 4.5 / Math.max(size.x, size.y, size.z);
-  const norm = new THREE.Matrix4()
-    .makeScale(s, s, s)
-    .multiply(new THREE.Matrix4().makeTranslation(-centre.x, -centre.y, -centre.z));
+  const box = new THREE.Box3().setFromObject(root);
+  const center = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3());
+  const maxDim = Math.max(size.x, size.y, size.z) || 1;
+  root.position.sub(center);
+  wrap.updateMatrixWorld(true);
 
-  const meshes = [];
-  root.traverse((o) => {
-    if (o.isMesh && !o.isSkinnedMesh && o.geometry?.attributes?.position) meshes.push(o);
-  });
-
-  // every mesh becomes one part, moved on its own when exploding
-  const modelGroup = new THREE.Group();
   const parts = [];
-  const box = new THREE.Box3();
-  const partOfMesh = new Map();
+  root.traverse((o) => {
+    if (!o.isMesh) return;
+    o.material = Array.isArray(o.material) ? o.material.map((m) => m.clone()) : o.material.clone();
+    o.geometry.computeBoundingBox();
+    tmpBox.setFromObject(o);
+    const wc = tmpBox.getCenter(new THREE.Vector3());
+    const sz = tmpBox.getSize(new THREE.Vector3());
 
-  meshes.forEach((mesh, i) => {
-    const base = norm.clone().multiply(mesh.matrixWorld);
-    if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
-    box.copy(mesh.geometry.boundingBox).applyMatrix4(base);
-    const c = box.getCenter(new THREE.Vector3());
-    const partSize = box.getSize(new THREE.Vector3()).length();
+    const len = wc.length();
+    const dir = len > 1e-6 ? wc.clone().divideScalar(len) : new THREE.Vector3(0, 1, 0);
+    const dist = maxDim * 0.9 * Math.min(1, 0.35 + len / (maxDim * 0.5));
+    const parent = o.parent;
+    const full = parent.worldToLocal(wc.clone().addScaledVector(dir, dist)).sub(parent.worldToLocal(wc.clone()));
 
-    const dir = c.clone();
-    if (dir.length() < 0.05) dir.set(Math.cos(i * 2.1), Math.sin(i * 1.3), Math.sin(i * 2.1));
-    dir.normalize();
+    const mats = (Array.isArray(o.material) ? o.material : [o.material])
+      .filter((m) => m.emissive)
+      .map((m) => ({ m, c: m.emissive.clone(), i: m.emissiveIntensity }));
 
-    // own copy of the materials so we can highlight / dim a single part
-    const wasArray = Array.isArray(mesh.material);
-    const mats = (wasArray ? mesh.material : [mesh.material]).map((m) => m.clone());
-    mesh.material = wasArray ? mats : mats[0];
-    const orig = mats.map((m) => ({
-      transparent: m.transparent,
-      opacity: m.opacity,
-      depthWrite: m.depthWrite,
-      emissive: m.emissive ? m.emissive.clone() : null,
-      emissiveIntensity: m.emissiveIntensity,
-    }));
-
-    const idx = mesh.geometry.index;
-    const tris = Math.round((idx ? idx.count : mesh.geometry.attributes.position.count) / 3);
-
-    mesh.matrixAutoUpdate = false;
-    mesh.matrix.copy(base);
-    mesh.matrixWorldNeedsUpdate = true;
-    modelGroup.add(mesh);
-
-    const part = { rawName: mesh.name, center: c, dir, mesh, base, mats, orig, tris, size: partSize };
-    parts.push(part);
-    partOfMesh.set(mesh, i);
-  });
-
-  // readable unique names ("Wheel 1", "Wheel 2"...) and descriptions
-  const baseNames = parts.map((p, i) => cleanName(p.rawName) || `Part ${i + 1}`);
-  const seen = {};
-  baseNames.forEach((n) => (seen[n] = (seen[n] || 0) + 1));
-  const used = {};
-  const totalTris = parts.reduce((a, p) => a + p.tris, 0) || 1;
-  parts.forEach((p, i) => {
-    const n = baseNames[i];
-    used[n] = (used[n] || 0) + 1;
-    p.name = seen[n] === 1 ? n : `${n} ${used[n]}`;
-    p.desc = describe(n, modelName);
-    p.share = ((p.tris / totalTris) * 100).toFixed(1);
-  });
-
-  // labels: the biggest parts are shown by default, any part when selected
-  const ranked = parts.map((p, i) => i).sort((a, b) => parts[b].size - parts[a].size);
-  const eligible = new Set(ranked.slice(0, 12));
-  const labels = parts.map((p, i) => {
-    const el = document.createElement('div');
-    el.className = 'label';
-    el.textContent = p.name;
-    el.style.display = 'none';
-    labelsEl.appendChild(el);
-    return { el, part: p, index: i, eligible: eligible.has(i) };
-  });
-
-  modelGroup.visible = false;
-  group.add(modelGroup);
-  return { name: modelName, group: modelGroup, parts, labels, partOfMesh, appliedExplode: null };
-}
-
-function applyExplode(model, v) {
-  if (model.appliedExplode !== null && Math.abs(model.appliedExplode - v) < 1e-4) return;
-  model.appliedExplode = v;
-  for (const p of model.parts) {
-    tmpM.makeTranslation(p.dir.x * v, p.dir.y * v, p.dir.z * v);
-    p.mesh.matrix.multiplyMatrices(tmpM, p.base);
-    p.mesh.matrixWorldNeedsUpdate = true;
-  }
-}
-
-/* highlight one part and fade the others (idx < 0 restores everything) */
-function applySel(model, idx) {
-  model.parts.forEach((p, i) => {
-    p.mats.forEach((m, k) => {
-      const o = p.orig[k];
-      const wasTransparent = m.transparent;
-      m.transparent = o.transparent;
-      m.opacity = o.opacity;
-      m.depthWrite = o.depthWrite;
-      if (m.emissive) {
-        m.emissive.copy(o.emissive);
-        m.emissiveIntensity = o.emissiveIntensity;
-      }
-      if (idx >= 0 && i === idx) {
-        if (m.emissive) {
-          m.emissive.set(0xffa733);
-          m.emissiveIntensity = 0.55;
-        }
-      } else if (idx >= 0) {
-        m.transparent = true;
-        m.opacity = Math.min(o.opacity, 0.1);
-        m.depthWrite = false;
-      }
-      if (m.transparent !== wasTransparent) m.needsUpdate = true;
+    parts.push({
+      mesh: o,
+      name: cleanName(o.name || parent.name || ''),
+      base: o.position.clone(),
+      full,
+      localCenter: o.geometry.boundingBox.getCenter(new THREE.Vector3()),
+      vol: sz.x * sz.y * sz.z,
+      drag: new THREE.Vector3(),
+      dragTarget: new THREE.Vector3(),
+      mats,
     });
   });
+
+  wrap.scale.setScalar(CONFIG.modelSize / maxDim);
+  const byMesh = new Map(parts.map((p) => [p.mesh, p]));
+  const top = [...parts].sort((a, b) => b.vol - a.vol).slice(0, CONFIG.maxLabels);
+  return { wrap, parts, byMesh, top };
 }
 
-/* ---------------- Model list, switching, selection ---------------- */
-const models = [];
-let current = 0;
-let selected = -1;
+async function loadModel(i) {
+  const token = ++S.loadToken;
+  const def = MODELS[i];
+  say(`Loading ${def.name}…`, 0);
+  try {
+    let entry = cache.get(i);
+    if (!entry) {
+      const gltf = await loader.loadAsync(def.file);
+      entry = prepare(gltf);
+      cache.set(i, entry);
+    }
+    if (token !== S.loadToken) return;
 
-function addModel(m) {
-  models.push(m);
-  if (models.length === 1) showModel(0);
-}
+    if (S.current) rig.remove(S.current.wrap);
+    select(null);
+    S.current = entry;
+    S.index = i;
+    rig.add(entry.wrap);
+    S.t.explode = 0;
+    S.cur.explode = 0;
+    buildLabels(entry);
 
-function showModel(i) {
-  if (models[current]) applySel(models[current], -1);
-  selected = -1;
-  infoEl.style.display = 'none';
-  models.forEach((m, k) => {
-    m.group.visible = k === i;
-    m.labels.forEach((l) => (l.el.style.display = k === i ? '' : 'none'));
-  });
-  current = i;
-  models[i].appliedExplode = null; // force re-apply the current explosion
-}
-
-let lastSwitch = 0;
-function stepModel(dir = 1) {
-  const now = performance.now();
-  if (now - lastSwitch < 700 || models.length < 2) return;
-  lastSwitch = now;
-  showModel((current + dir + models.length) % models.length);
-}
-
-function select(i) {
-  const m = models[current];
-  if (!m) return;
-  selected = i;
-  applySel(m, i);
-  if (i < 0) {
-    infoEl.style.display = 'none';
-    return;
+    ui.title.textContent = def.name;
+    ui.blurb.textContent = def.blurb;
+    ui.group.textContent = def.group;
+    ui.parts.textContent = `${entry.parts.length} parts`;
+    [...ui.models.querySelectorAll('button')].forEach((b) => b.classList.toggle('on', Number(b.dataset.i) === i));
+    toast.classList.remove('show');
+  } catch (err) {
+    console.error(err);
+    say(`Could not load ${def.file}. Check public/models/`, 4000);
   }
-  const p = m.parts[i];
-  infoName.textContent = p.name;
-  infoDesc.textContent = p.desc;
-  infoMeta.textContent = `${p.tris.toLocaleString()} triangles · ${p.share}% of the model`;
-  infoEl.style.display = 'block';
 }
 
-/* where is a part on screen right now? */
+function buildModelBar() {
+  const groups = new Map();
+  MODELS.forEach((m, i) => {
+    if (!groups.has(m.group)) groups.set(m.group, []);
+    groups.get(m.group).push(i);
+  });
+  groups.forEach((idx, name) => {
+    const g = document.createElement('div');
+    g.className = 'grp';
+    g.innerHTML = `<span>${name}</span>`;
+    idx.forEach((i) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.dataset.i = i;
+      b.textContent = MODELS[i].name;
+      b.addEventListener('click', () => loadModel(i));
+      g.appendChild(b);
+    });
+    ui.models.appendChild(g);
+  });
+}
+
+const nextModel = () => loadModel((S.index + 1) % MODELS.length);
+
+/* =====================================================================
+   PARTS: explode, select, highlight, pick
+   ===================================================================== */
+const inv = new THREE.Matrix4();
+const v0 = new THREE.Vector3();
+const v1 = new THREE.Vector3();
+
+function dragToLocal(p) {
+  inv.copy(p.mesh.parent.matrixWorld).invert();
+  v1.copy(p.drag).applyMatrix4(inv);
+  v0.set(0, 0, 0).applyMatrix4(inv);
+  return v1.sub(v0);
+}
+
+function applyExplode(dt) {
+  if (!S.current) return;
+  const k = S.cur.explode * S.intensity;
+  for (const p of S.current.parts) {
+    p.mesh.position.copy(p.base).addScaledVector(p.full, k);
+    const moving = p.dragTarget.lengthSq() > 0 || p.drag.lengthSq() > 1e-8;
+    if (moving) {
+      p.drag.x = damp(p.drag.x, p.dragTarget.x, 14, dt);
+      p.drag.y = damp(p.drag.y, p.dragTarget.y, 14, dt);
+      p.drag.z = damp(p.drag.z, p.dragTarget.z, 14, dt);
+      if (p.drag.lengthSq() < 1e-8 && p.dragTarget.lengthSq() === 0) p.drag.set(0, 0, 0);
+      else p.mesh.position.add(dragToLocal(p));
+    }
+  }
+}
+
+function setGlow(p, on) {
+  if (!p) return;
+  p.mats.forEach(({ m, c, i }) => {
+    if (on) {
+      m.emissive.set(0xffb800);
+      m.emissiveIntensity = 0.55;
+    } else {
+      m.emissive.copy(c);
+      m.emissiveIntensity = i;
+    }
+  });
+}
+
+function select(p) {
+  if (S.selected === p) return;
+  setGlow(S.selected, false);
+  S.selected = p;
+  setGlow(p, true);
+  ui.info.classList.toggle('has', !!p);
+  if (p) {
+    const n = S.current.parts.indexOf(p) + 1;
+    ui.infoTitle.textContent = p.name;
+    ui.infoText.textContent = `Part ${n} of ${S.current.parts.length}. Pinch it to pull it out.`;
+  } else {
+    ui.infoTitle.textContent = 'No part selected';
+    ui.infoText.textContent = 'Point at a part, or click one, to see its name.';
+  }
+}
+
 const tmpV = new THREE.Vector3();
-function projectPart(p) {
-  tmpV.copy(p.center).addScaledVector(p.dir, state.explode);
-  group.localToWorld(tmpV);
+function projectPart(p, out) {
+  tmpV.copy(p.localCenter);
+  p.mesh.localToWorld(tmpV);
   tmpV.project(camera);
-  return {
-    x: (tmpV.x * 0.5 + 0.5) * innerWidth,
-    y: (-tmpV.y * 0.5 + 0.5) * innerHeight,
-    visible: tmpV.z < 1,
-  };
+  out.x = (tmpV.x + 1) / 2;
+  out.y = (1 - tmpV.y) / 2;
+  return out;
 }
 
 function nearestPart(sx, sy, maxDist) {
-  const m = models[current];
-  if (!m) return -1;
-  group.updateMatrixWorld();
-  let best = -1;
+  if (!S.current) return null;
+  rig.updateMatrixWorld(true);
+  const aspect = stage.clientWidth / stage.clientHeight;
+  const out = { x: 0, y: 0 };
+  let best = null;
   let bestD = maxDist;
-  m.parts.forEach((p, i) => {
-    const s = projectPart(p);
-    if (!s.visible) return;
-    const d = Math.hypot(s.x - sx, s.y - sy);
+  for (const p of S.current.parts) {
+    projectPart(p, out);
+    const d = Math.hypot((out.x - sx) * aspect, out.y - sy);
     if (d < bestD) {
       bestD = d;
-      best = i;
+      best = p;
     }
-  });
+  }
   return best;
 }
 
-/* shoot a ray from the cursor into the model; fall back to the closest part centre */
-const raycaster = new THREE.Raycaster();
-const ndc = new THREE.Vector2();
-function pickPart(sx, sy) {
-  const m = models[current];
-  if (!m) return -1;
-  ndc.set((sx / innerWidth) * 2 - 1, -(sy / innerHeight) * 2 + 1);
-  raycaster.setFromCamera(ndc, camera);
-  scene.updateMatrixWorld(true);
-  const hit = raycaster.intersectObjects(m.group.children, false)[0];
-  if (hit && m.partOfMesh.has(hit.object)) return m.partOfMesh.get(hit.object);
-  return nearestPart(sx, sy, 60);
+const ray = new THREE.Raycaster();
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  if (!S.current) return;
+  const r = renderer.domElement.getBoundingClientRect();
+  ray.setFromCamera({ x: ((e.clientX - r.left) / r.width) * 2 - 1, y: -((e.clientY - r.top) / r.height) * 2 + 1 }, camera);
+  const hit = ray.intersectObjects(S.current.parts.map((p) => p.mesh), false)[0];
+  select(hit ? S.current.byMesh.get(hit.object) : null);
+});
+
+/* =====================================================================
+   LABELS with leader lines
+   ===================================================================== */
+let labels = [];
+function buildLabels(entry) {
+  tagsEl.innerHTML = '';
+  linesSvg.innerHTML = '';
+  labels = entry.top.map((p) => {
+    const tag = document.createElement('div');
+    tag.className = 'tag';
+    tag.textContent = p.name;
+    tagsEl.appendChild(tag);
+    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    dot.setAttribute('r', '2.5');
+    linesSvg.append(line, dot);
+    return { p, tag, line, dot, w: tag.offsetWidth, h: tag.offsetHeight };
+  });
 }
 
 function updateLabels() {
-  const m = models[current];
-  if (!m) return;
-  group.updateMatrixWorld();
-  const vis = THREE.MathUtils.smoothstep(state.explode, 0.25, 1.0);
-  for (const l of m.labels) {
-    const isSel = l.index === selected;
-    if (!l.eligible && !isSel) {
-      l.el.style.opacity = 0;
-      continue;
-    }
-    const s = projectPart(l.part);
-    const a = isSel ? 1 : selected >= 0 ? Math.min(vis, 0.3) : vis;
-    l.el.style.opacity = s.visible ? a : 0;
-    l.el.style.transform = `translate(${s.x}px, ${s.y}px) translate(-50%, -140%)`;
-    l.el.classList.toggle('sel', isSel);
-  }
+  const show = S.cur.explode > 0.12 && labels.length > 0;
+  const sw = stage.clientWidth;
+  const sh = stage.clientHeight;
+  labels.forEach((l) => {
+    l.tag.style.opacity = show ? 1 : 0;
+    l.line.style.display = l.dot.style.display = show ? '' : 'none';
+  });
+  if (!show) return;
+
+  rig.updateMatrixWorld(true);
+  const pt = { x: 0, y: 0 };
+  const items = labels.map((l) => {
+    projectPart(l.p, pt);
+    return { l, x: pt.x * sw, y: pt.y * sh };
+  });
+  items.sort((a, b) => a.x - b.x);
+  const half = Math.ceil(items.length / 2);
+  const left = items.slice(0, half).sort((a, b) => a.y - b.y);
+  const right = items.slice(half).sort((a, b) => a.y - b.y);
+
+  const leftX = panel.getBoundingClientRect().right + 28;
+  const rightX = sw - 28;
+  const y0 = sh * 0.2;
+  const y1 = sh * 0.78;
+  const place = (arr, side) =>
+    arr.forEach((it, k) => {
+      const y = arr.length === 1 ? (y0 + y1) / 2 : y0 + ((y1 - y0) * k) / (arr.length - 1);
+      const { l } = it;
+      const tx = side === 'L' ? leftX : rightX - l.w;
+      l.tag.style.transform = `translate(${tx}px, ${y - l.h / 2}px)`;
+      const ex = side === 'L' ? tx + l.w + 4 : tx - 4;
+      const sel = S.selected === l.p;
+      l.tag.classList.toggle('sel', sel);
+      l.line.classList.toggle('sel', sel);
+      l.line.setAttribute('x1', ex);
+      l.line.setAttribute('y1', y);
+      l.line.setAttribute('x2', it.x);
+      l.line.setAttribute('y2', it.y);
+      l.dot.setAttribute('cx', it.x);
+      l.dot.setAttribute('cy', it.y);
+    });
+  place(left, 'L');
+  place(right, 'R');
 }
 
-/* mouse / keyboard fallbacks (handy for testing without a camera) */
-addEventListener('click', (e) => select(pickPart(e.clientX, e.clientY)));
-addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') select(-1);
-  if (e.key === 'n' || e.key === 'N') stepModel(1);
-  if (e.key === 'p' || e.key === 'P') stepModel(-1);
-});
-
-/* ---------------- Hand tracking ---------------- */
+/* =====================================================================
+   HAND TRACKING
+   ===================================================================== */
 let landmarker = null;
 
-async function initHands() {
-  const fileset = await FilesetResolver.forVisionTasks(WASM);
-  const opts = (delegate) => ({
-    baseOptions: { modelAssetPath: HAND_MODEL, delegate },
-    runningMode: 'VIDEO',
-    numHands: 2,
-  });
-  try {
-    return await HandLandmarker.createFromOptions(fileset, opts('GPU'));
-  } catch {
-    return await HandLandmarker.createFromOptions(fileset, opts('CPU'));
-  }
-}
-
-const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
-const clamp = THREE.MathUtils.clamp;
-
-// 0 = fist, 1 = fully open hand
-function openness(h) {
-  const scale = dist(h[0], h[9]) || 0.001;
-  const tips = [8, 12, 16, 20];
-  const r = tips.reduce((s, i) => s + dist(h[i], h[0]), 0) / tips.length / scale;
-  return clamp((r - 1.1) / 0.6, 0, 1); // tweak 1.1 / 0.6 if it feels off
-}
-
-// centre of the palm (more stable than a single landmark)
-function palmCenter(h) {
-  let x = 0;
-  let y = 0;
-  for (const i of [0, 5, 9, 13, 17]) {
-    x += h[i].x;
-    y += h[i].y;
-  }
-  return { x: x / 5, y: y / 5 };
-}
-
-/* One Euro filter: very smooth when the hand is slow, still responsive when it is fast */
-class OneEuro {
-  constructor(minCutoff = 1.0, beta = 0.0, dCutoff = 1.0) {
-    this.minCutoff = minCutoff;
-    this.beta = beta;
-    this.dCutoff = dCutoff;
-    this.t = null;
-    this.x = 0;
-    this.dx = 0;
-  }
-  static alpha(cutoff, dt) {
-    const tau = 1 / (2 * Math.PI * cutoff);
-    return 1 / (1 + tau / dt);
-  }
-  filter(x, t) {
-    if (this.t === null || t - this.t > 0.4) {
-      this.t = t;
-      this.x = x;
-      this.dx = 0;
-      return x;
-    }
-    const dt = Math.max(t - this.t, 1e-3);
-    this.dx += OneEuro.alpha(this.dCutoff, dt) * ((x - this.x) / dt - this.dx);
-    const cutoff = this.minCutoff + this.beta * Math.abs(this.dx);
-    this.x += OneEuro.alpha(cutoff, dt) * (x - this.x);
-    this.t = t;
-    return this.x;
-  }
-  reset() {
-    this.t = null;
-  }
-}
-
-// lower first number = smoother (but laggier); higher beta = snappier when moving fast
-const fPalmX = new OneEuro(0.5, 3);
-const fPalmY = new OneEuro(0.5, 3);
-const fOpen = new OneEuro(0.8, 1.5);
-const fZoom = new OneEuro(0.6, 3);
-const fCurX = new OneEuro(1.2, 8);
-const fCurY = new OneEuro(1.2, 8);
-const fPinch = new OneEuro(1.2, 4);
-const allFilters = [fPalmX, fPalmY, fOpen, fZoom, fCurX, fCurY, fPinch];
-const resetFilters = () => allFilters.forEach((f) => f.reset());
-
-const state = {
-  explode: 0, explodeT: 0,
-  rotY: 0, rotYT: 0,
-  rotX: 0, rotXT: 0,
-  posX: 0, posXT: 0,
-  posY: 0, posYT: 0,
-  zoom: ZOOM_START, zoomT: ZOOM_START,
-  zoomRef: null,
-  hands: 0,
-  openness: 0,
-  pinching: false,
-  wasPinching: false,
-  palmHist: [],
-  swipeLockUntil: 0,
-};
-
-function drawHands(list) {
-  octx.clearRect(0, 0, overlay.width, overlay.height);
-  octx.fillStyle = '#4cc9f0';
-  for (const h of list) {
-    for (const p of h) {
-      octx.beginPath();
-      octx.arc(p.x * overlay.width, p.y * overlay.height, 4, 0, Math.PI * 2);
-      octx.fill();
-    }
-  }
-}
-
-function handleHands(list, now) {
-  state.hands = list.length;
-  drawHands(list);
-
-  /* ---- no hands: settle back to the centre ---- */
-  if (!list.length) {
-    cursorEl.style.display = 'none';
-    state.wasPinching = state.pinching = false;
-    state.palmHist.length = 0;
-    state.zoomRef = null;
-    resetFilters();
-    if (selected < 0) {
-      state.explodeT = 0;
-      state.posXT = 0;
-      state.posYT = 0;
-    }
-    return;
-  }
-
-  /* ---- two hands: zoom (spread apart = in, together = out) ---- */
-  if (list.length === 2) {
-    cursorEl.style.display = 'none';
-    state.wasPinching = state.pinching = false;
-    state.palmHist.length = 0;
-    const a = palmCenter(list[0]);
-    const b = palmCenter(list[1]);
-    const d = Math.max(fZoom.filter(dist(a, b), now), 0.04);
-    if (!state.zoomRef) state.zoomRef = { d, zoom: state.zoomT }; // remember the start
-    state.zoomT = clamp((state.zoomRef.zoom * state.zoomRef.d) / d, ZOOM_MIN, ZOOM_MAX);
-    return;
-  }
-  state.zoomRef = null;
-
-  /* ---- one hand ---- */
-  const h = list[0];
-  const scale = dist(h[0], h[9]) || 0.001;
-  const ratio = fPinch.filter(dist(h[4], h[8]) / scale, now); // thumb tip <-> index tip
-
-  if (state.pinching) {
-    if (ratio > 0.45) state.pinching = false;
-  } else if (ratio < 0.3) {
-    state.pinching = true;
-  }
-  const near = ratio < 0.6; // about to pinch: freeze the view so aiming is easy
-
-  // cursor = midpoint between thumb and index (image is mirrored on screen)
-  const mx = fCurX.filter((h[4].x + h[8].x) / 2, now);
-  const my = fCurY.filter((h[4].y + h[8].y) / 2, now);
-  const sx = (1 - mx) * innerWidth;
-  const sy = my * innerHeight;
-  cursorEl.style.display = 'block';
-  cursorEl.style.transform = `translate(${sx}px, ${sy}px) translate(-50%, -50%)`;
-  cursorEl.classList.toggle('pinch', state.pinching);
-
-  // pinch started -> select the part under the cursor (or clear if there is none)
-  if (state.pinching && !state.wasPinching) select(pickPart(sx, sy));
-  state.wasPinching = state.pinching;
-
-  if (near) {
-    state.palmHist.length = 0;
-    return;
-  }
-
-  const palm = palmCenter(h);
-
-  /* swipe: raw palm path over the last ~0.4 s, in screen space (so mirrored) */
-  state.palmHist.push({ t: now, x: 1 - palm.x, y: palm.y });
-  while (state.palmHist.length && now - state.palmHist[0].t > SWIPE_WINDOW) state.palmHist.shift();
-  const first = state.palmHist[0];
-  const last = state.palmHist[state.palmHist.length - 1];
-  const dx = last.x - first.x;
-  const dy = last.y - first.y;
-  const swiped =
-    state.palmHist.length >= 4 && Math.abs(dx) >= SWIPE_DIST && Math.abs(dy) < Math.abs(dx) * 0.7;
-
-  if (swiped && now > state.swipeLockUntil) {
-    state.swipeLockUntil = now + SWIPE_COOLDOWN;
-    state.palmHist.length = 0;
-    if (dx < 0) stepModel(1); // right -> left = next
-    else if (SWIPE_PREVIOUS) stepModel(-1); // left -> right = previous (optional)
-    return;
-  }
-
-  if (selected >= 0) return; // inspecting a part: keep the view still
-
-  /* explode / assemble follows how open the hand is */
-  state.openness = fOpen.filter(openness(h), now);
-  state.explodeT = state.openness * 3;
-
-  /* the model follows the hand (and turns a little with it) */
-  if (now < state.swipeLockUntil) {
-    // just swiped: let the new model glide back to the centre
-    state.posXT = 0;
-    state.posYT = 0;
-    return;
-  }
-  const px = 1 - fPalmX.filter(palm.x, now); // mirrored, 0..1 left to right
-  const py = fPalmY.filter(palm.y, now); // 0..1 top to bottom
-  const visH = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * state.zoom;
-  const visW = visH * camera.aspect;
-  state.posXT = (px - 0.5) * visW * FOLLOW_MOVE;
-  state.posYT = -(py - 0.5) * visH * FOLLOW_MOVE;
-  state.rotYT = (px - 0.5) * 1.6 * FOLLOW_ROTATE;
-  state.rotXT = (py - 0.5) * 0.9 * FOLLOW_ROTATE;
-}
-
-/* ---------------- Main loop ---------------- */
-let lastVideoTime = -1;
-let frames = 0;
-let fpsTime = performance.now();
-let lastFrame = performance.now();
-let statusMsg = '';
-
-function loop() {
-  requestAnimationFrame(loop);
-
-  const frameStart = performance.now();
-  const dt = Math.min((frameStart - lastFrame) / 1000, 0.1);
-  lastFrame = frameStart;
-
-  if (landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
-    lastVideoTime = video.currentTime;
-    const res = landmarker.detectForVideo(video, performance.now());
-    handleHands(res.landmarks, performance.now() / 1000);
-  }
-
-  if (state.hands === 0 && selected < 0) state.rotYT += 0.25 * dt; // idle spin
-
-  // keep the spin angle small so it never unwinds a long way when a hand appears
-  if (state.rotYT > Math.PI) { state.rotYT -= Math.PI * 2; state.rotY -= Math.PI * 2; }
-  if (state.rotYT < -Math.PI) { state.rotYT += Math.PI * 2; state.rotY += Math.PI * 2; }
-
-  // frame-rate independent easing: smaller number = smoother and floatier
-  const ease = (rate) => 1 - Math.exp(-rate * dt);
-  state.explode += (state.explodeT - state.explode) * ease(5);
-  state.rotY += (state.rotYT - state.rotY) * ease(5);
-  state.rotX += (state.rotXT - state.rotX) * ease(5);
-  state.posX += (state.posXT - state.posX) * ease(5);
-  state.posY += (state.posYT - state.posY) * ease(5);
-  state.zoom += (state.zoomT - state.zoom) * ease(4);
-
-  if (models[current]) applyExplode(models[current], state.explode);
-  group.position.set(state.posX, state.posY, 0);
-  group.rotation.set(state.rotX, state.rotY, 0);
-  camera.position.z = state.zoom;
-
-  renderer.render(scene, camera);
-  updateLabels();
-
-  frames++;
-  const now = performance.now();
-  if (now - fpsTime > 500) {
-    const fps = Math.round((frames * 1000) / (now - fpsTime));
-    frames = 0;
-    fpsTime = now;
-    if (statusMsg) {
-      hud.textContent = statusMsg;
-    } else if (!models.length) {
-      hud.textContent = 'Loading 3D models…';
-    } else if (!landmarker) {
-      hud.textContent = 'Loading hand tracking…';
-    } else {
-      const sel = selected >= 0 ? models[current].parts[selected].name : '-';
-      hud.textContent =
-        `Model: ${models[current].name} (${current + 1}/${models.length})\n` +
-        `Hands: ${state.hands}   Pinch: ${state.pinching ? 'yes' : 'no'}\n` +
-        `Openness: ${(state.openness * 100).toFixed(0)}%   Zoom: ${(ZOOM_START / state.zoom).toFixed(2)}x\n` +
-        `Selected: ${sel}\n` +
-        `FPS: ${fps}`;
-    }
-  }
-}
-
-/* ---------------- Loading ---------------- */
-const draco = new DRACOLoader();
-draco.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.7/');
-const gltfLoader = new GLTFLoader();
-gltfLoader.setDRACOLoader(draco);
-
-async function loadModels() {
-  for (const { url, name } of GLB_MODELS) {
-    try {
-      const gltf = await gltfLoader.loadAsync(url);
-      addModel(modelFromGLTF(name, gltf));
-    } catch (err) {
-      console.warn(`Could not load ${url}`, err);
-    }
-  }
-  if (!models.length) statusMsg = 'No models loaded. Check public/models and the console (F12).';
-}
-
-async function start() {
-  loadModels(); // runs in the background; the first model appears as soon as it is ready
-
+async function startTracking() {
+  ui.track.textContent = 'Starting…';
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
-      video: { width: 640, height: 480 },
+      video: { width: 1280, height: 720, facingMode: 'user' },
+      audio: false,
     });
     video.srcObject = stream;
     await video.play();
-    landmarker = await initHands();
-  } catch (err) {
-    statusMsg = 'Camera/hand error: ' + err.message + '\n(mouse + N key still work)';
-    console.error(err);
+  } catch (e) {
+    ui.track.textContent = 'No camera';
+    ui.track.className = 'off';
+    say('Camera blocked. Allow camera access and reload.', 5000);
+    return;
+  }
+
+  const fileset = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/wasm');
+  const make = (delegate) =>
+    HandLandmarker.createFromOptions(fileset, {
+      baseOptions: {
+        modelAssetPath:
+          'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+        delegate,
+      },
+      runningMode: 'VIDEO',
+      numHands: 2,
+      minHandDetectionConfidence: 0.6,
+      minHandPresenceConfidence: 0.6,
+      minTrackingConfidence: 0.6,
+    });
+  try {
+    landmarker = await make('GPU');
+  } catch {
+    landmarker = await make('CPU');
+  }
+  ui.track.textContent = 'Show your hand';
+  ui.track.className = 'off';
+}
+
+/* video pixel -> normalised stage coords (handles object-fit: cover and the mirror) */
+function toScreen(p) {
+  const vw = video.videoWidth || 1280;
+  const vh = video.videoHeight || 720;
+  const sw = stage.clientWidth;
+  const sh = stage.clientHeight;
+  const s = Math.max(sw / vw, sh / vh);
+  const ox = (sw - vw * s) / 2;
+  const oy = (sh - vh * s) / 2;
+  return { x: 1 - (p.x * vw * s + ox) / sw, y: (p.y * vh * s + oy) / sh };
+}
+
+function worldFromScreen(sx, sy) {
+  const hh = halfH();
+  const hw = hh * camera.aspect;
+  return { x: (sx - 0.5) * 2 * hw, y: -(sy - 0.5) * 2 * hh };
+}
+
+function getFilters(h) {
+  if (!filters[h]) {
+    filters[h] = Array.from({ length: 21 }, () =>
+      [0, 1, 2].map(() => new OneEuro(CONFIG.filter.minCutoff, CONFIG.filter.beta)),
+    );
+  }
+  return filters[h];
+}
+
+function smoothHand(lm, h, t) {
+  const f = getFilters(h);
+  return lm.map((p, j) => ({
+    x: f[j][0].filter(p.x, t),
+    y: f[j][1].filter(p.y, t),
+    z: f[j][2].filter(p.z, t),
+  }));
+}
+
+const dd = (a, b) => {
+  const ar = (video.videoWidth || 16) / (video.videoHeight || 9);
+  return Math.hypot((a.x - b.x) * ar, a.y - b.y);
+};
+
+function palmCenter(lm) {
+  let x = 0;
+  let y = 0;
+  [0, 5, 9, 13, 17].forEach((i) => {
+    const s = toScreen(lm[i]);
+    x += s.x;
+    y += s.y;
+  });
+  return { x: x / 5, y: y / 5 };
+}
+
+function releasePinch() {
+  if (S.drag) S.drag.part.dragTarget.set(0, 0, 0);
+  S.drag = null;
+  S.pinching = false;
+}
+
+function flash(g, ms = 700) {
+  S.gesture = g;
+  S.gestureUntil = performance.now() + ms;
+}
+
+function processHands(result, now) {
+  const raw = (result.landmarks || []).slice(0, 2);
+  raw.sort((a, b) => a[0].x - b[0].x);
+
+  if (raw.length !== S.handCount) {
+    filters.length = 0;
+    S.handCount = raw.length;
+    S.swipeHist.length = 0;
+    S.twoStart = null;
+    releasePinch();
+  }
+  S.hands = raw.map((l, i) => smoothHand(l, i, now));
+  if (S.hands.length) S.lastSeen = now;
+
+  ui.hands.textContent = S.hands.length;
+  ui.track.textContent = S.hands.length ? 'Hands on' : 'Show your hand';
+  ui.track.className = S.hands.length ? 'on' : 'off';
+
+  const T = S.t;
+  const H = S.hands;
+
+  if (H.length === 2) {
+    /* ---- two hands: zoom + move ---- */
+    const a = palmCenter(H[0]);
+    const b = palmCenter(H[1]);
+    const aspect = stage.clientWidth / stage.clientHeight;
+    const d = Math.hypot((a.x - b.x) * aspect, a.y - b.y);
+    if (!S.twoStart) S.twoStart = { d, scale: T.scale };
+    T.scale = clamp((S.twoStart.scale * d) / Math.max(S.twoStart.d, 0.05), 0.35, 3.2);
+    const w = worldFromScreen((a.x + b.x) / 2, (a.y + b.y) / 2);
+    T.px = w.x;
+    T.py = w.y;
+    if (!S.gestureUntil || performance.now() > S.gestureUntil) S.gesture = 'two';
+    releasePinch();
+    return;
+  }
+
+  S.twoStart = null;
+  if (H.length !== 1) return;
+
+  /* ---- one hand ---- */
+  const lm = H[0];
+  const palm = Math.max(dd(lm[0], lm[9]), 0.01);
+  const c = palmCenter(lm);
+  const world = worldFromScreen(c.x, c.y);
+
+  // pinch (with hysteresis)
+  const pinchD = dd(lm[4], lm[8]) / palm;
+  const pinchPt = toScreen({ x: (lm[4].x + lm[8].x) / 2, y: (lm[4].y + lm[8].y) / 2 });
+  if (!S.pinching && pinchD < CONFIG.pinchOn) {
+    S.pinching = true;
+    const part = nearestPart(pinchPt.x, pinchPt.y, 0.16);
+    if (part) {
+      select(part);
+      S.drag = { part, start: worldFromScreen(pinchPt.x, pinchPt.y) };
+    }
+  } else if (S.pinching && pinchD > CONFIG.pinchOff) {
+    releasePinch();
+  }
+
+  if (S.pinching) {
+    if (S.drag) {
+      const w = worldFromScreen(pinchPt.x, pinchPt.y);
+      S.drag.part.dragTarget.set(w.x - S.drag.start.x, w.y - S.drag.start.y, 0);
+    }
+    S.gesture = 'pinch';
+    return; // model stays still while a part is being pulled
+  }
+
+  // pointing: index out, other fingers curled
+  const ext = (tip, pip) => dd(lm[tip], lm[0]) > dd(lm[pip], lm[0]) * 1.08;
+  const pointing = ext(8, 6) && !ext(12, 10) && !ext(16, 14) && !ext(20, 18);
+  if (pointing) {
+    const tip = toScreen(lm[8]);
+    const part = nearestPart(tip.x, tip.y, 0.13);
+    if (part) select(part);
+    S.gesture = 'point';
+    T.px = world.x;
+    T.py = world.y;
+    return;
+  }
+
+  // move
+  T.px = world.x;
+  T.py = world.y;
+
+  // twist / tilt from the palm orientation
+  const sgn = lm[5].x < lm[17].x ? 1 : -1;
+  const wx = Math.abs(lm[17].x - lm[5].x) + 0.001;
+  T.rz = clamp(Math.atan2((lm[17].y - lm[5].y) * sgn, wx), -1.4, 1.4);
+  T.ry = clamp(Math.atan2((lm[17].z - lm[5].z) * sgn, wx) * CONFIG.yawGain, -1.5, 1.5);
+  T.rx = clamp(Math.atan2(lm[9].z - lm[0].z, dd(lm[0], lm[9]) + 0.001) * CONFIG.pitchGain, -1.1, 1.1);
+
+  // explode from how open the hand is
+  const tips = [8, 12, 16, 20];
+  const avg = tips.reduce((s, i) => s + dd(lm[i], lm[0]), 0) / 4;
+  const open = clamp01(openFilter.filter(clamp01((avg / palm - 1.15) / 0.8), now));
+  T.explode = open;
+  const rate = (open - S.openPrev) / 0.033;
+  S.openPrev = open;
+  if (performance.now() > S.gestureUntil) {
+    S.gesture = rate > 0.7 ? 'open' : rate < -0.7 ? 'close' : 'move';
+  }
+
+  // swipe right-to-left = next model
+  S.swipeHist.push({ t: now, x: c.x });
+  while (S.swipeHist.length && now - S.swipeHist[0].t > CONFIG.swipe.windowMs) S.swipeHist.shift();
+  if (S.swipeHist.length > 3 && now > S.swipeCooldown && open > 0.35) {
+    const dx = c.x - S.swipeHist[0].x;
+    if (dx < -CONFIG.swipe.dist) {
+      S.swipeCooldown = now + CONFIG.swipe.cooldownMs;
+      S.swipeHist.length = 0;
+      flash('swipe');
+      nextModel();
+    }
   }
 }
 
-loop();
-start();
+/* =====================================================================
+   HUD: hand skeleton + openness ring
+   ===================================================================== */
+function drawHud() {
+  const w = stage.clientWidth;
+  const h = stage.clientHeight;
+  hctx.clearRect(0, 0, w, h);
+  for (const lm of S.hands) {
+    const pts = lm.map((p) => {
+      const s = toScreen(p);
+      return { x: s.x * w, y: s.y * h };
+    });
+    hctx.lineWidth = 1.6;
+    hctx.strokeStyle = 'rgba(127, 227, 255, 0.85)';
+    hctx.beginPath();
+    HAND_LINKS.forEach(([a, b]) => {
+      hctx.moveTo(pts[a].x, pts[a].y);
+      hctx.lineTo(pts[b].x, pts[b].y);
+    });
+    hctx.stroke();
+    hctx.fillStyle = '#fff';
+    pts.forEach((p) => {
+      hctx.beginPath();
+      hctx.arc(p.x, p.y, 2.6, 0, Math.PI * 2);
+      hctx.fill();
+    });
+
+    const cx = (pts[0].x + pts[9].x) / 2;
+    const cy = (pts[0].y + pts[9].y) / 2;
+    const r = Math.hypot(pts[0].x - pts[9].x, pts[0].y - pts[9].y) * 1.6;
+    hctx.lineWidth = 2;
+    hctx.strokeStyle = 'rgba(255,255,255,0.18)';
+    hctx.beginPath();
+    hctx.arc(cx, cy, r, 0, Math.PI * 2);
+    hctx.stroke();
+    hctx.strokeStyle = '#ffc83a';
+    hctx.lineWidth = 3;
+    hctx.beginPath();
+    hctx.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + S.cur.explode * Math.PI * 2);
+    hctx.stroke();
+  }
+}
+
+/* =====================================================================
+   MAIN LOOP
+   ===================================================================== */
+let last = performance.now();
+let lastVideoTime = -1;
+
+function loop(now) {
+  requestAnimationFrame(loop);
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+
+  // run detection only when the camera produced a new frame
+  if (landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    processHands(landmarker.detectForVideo(video, now), now);
+  }
+
+  const T = S.t;
+  const C = S.cur;
+  if (!S.hands.length && now - S.lastSeen > 1500) {
+    T.px = 0;
+    T.py = 0;
+    T.rx = 0;
+    T.rz = 0;
+  }
+  C.px = damp(C.px, T.px, CONFIG.follow, dt);
+  C.py = damp(C.py, T.py, CONFIG.follow, dt);
+  C.rx = damp(C.rx, T.rx, CONFIG.rotate, dt);
+  C.ry = damp(C.ry, T.ry, CONFIG.rotate, dt);
+  C.rz = damp(C.rz, T.rz, CONFIG.rotate, dt);
+  C.scale = damp(C.scale, T.scale, CONFIG.zoom, dt);
+  C.explode = damp(C.explode, T.explode, CONFIG.explode, dt);
+
+  if (S.autoSpin && !S.hands.length) S.spin += dt * 0.5;
+
+  rig.position.set(C.px, C.py, 0);
+  rig.rotation.set(C.rx, C.ry + S.spin, C.rz);
+  rig.scale.setScalar(C.scale);
+  applyExplode(dt);
+
+  if (!S.sliderActive) {
+    ui.exRange.value = C.explode;
+    ui.exVal.textContent = `${Math.round(C.explode * 100)}%`;
+  }
+
+  ui.gestures.forEach((li) => li.classList.toggle('active', li.dataset.g === S.gesture && S.hands.length > 0));
+
+  renderer.render(scene, camera);
+  updateLabels();
+  drawHud();
+}
+
+/* =====================================================================
+   UI WIRING
+   ===================================================================== */
+ui.exRange.addEventListener('pointerdown', () => (S.sliderActive = true));
+window.addEventListener('pointerup', () => (S.sliderActive = false));
+ui.exRange.addEventListener('input', () => {
+  S.t.explode = Number(ui.exRange.value);
+  ui.exVal.textContent = `${Math.round(S.t.explode * 100)}%`;
+});
+ui.inRange.addEventListener('input', () => {
+  S.intensity = Number(ui.inRange.value);
+  ui.inVal.textContent = `${Math.round(S.intensity * 100)}%`;
+});
+$('#btnAssemble').addEventListener('click', () => (S.t.explode = 0));
+ui.spin.addEventListener('click', () => {
+  S.autoSpin = !S.autoSpin;
+  ui.spin.classList.toggle('on', S.autoSpin);
+});
+$('#btnFull').addEventListener('click', () => {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen?.();
+});
+$('#btnSnap').addEventListener('click', () => {
+  const w = renderer.domElement.width;
+  const h = renderer.domElement.height;
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  const g = c.getContext('2d');
+  const vw = video.videoWidth || w;
+  const vh = video.videoHeight || h;
+  const s = Math.max(w / vw, h / vh);
+  g.save();
+  g.translate(w, 0);
+  g.scale(-1, 1); // mirror like the live view
+  g.drawImage(video, (w - vw * s) / 2, (h - vh * s) / 2, vw * s, vh * s);
+  g.restore();
+  renderer.render(scene, camera);
+  g.drawImage(renderer.domElement, 0, 0);
+  const a = document.createElement('a');
+  a.download = `gesture-3d-${Date.now()}.png`;
+  a.href = c.toDataURL('image/png');
+  a.click();
+  say('Snapshot saved');
+});
+
+/* keyboard fallback for testing without a camera */
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowRight') nextModel();
+  if (e.key === 'e') S.t.explode = S.t.explode > 0.5 ? 0 : 1;
+});
+
+buildModelBar();
+loadModel(0);
+requestAnimationFrame(loop);
+startTracking();
